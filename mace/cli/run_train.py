@@ -801,6 +801,7 @@ def run(args) -> None:
             "MACE",
             "ScaleShiftMACE",
             "MACELES",
+            "MACESOG",
             "PolarMACE",
         ]
         model = run_e3nn_to_cueq(deepcopy(model), device=device)
@@ -810,6 +811,7 @@ def run(args) -> None:
             "MACE",
             "ScaleShiftMACE",
             "MACELES",
+            "MACESOG",
             "PolarMACE",
         ]
         model = run_e3nn_to_oeq(deepcopy(model), device=device)

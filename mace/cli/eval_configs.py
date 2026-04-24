@@ -122,7 +122,7 @@ def get_model_output(
     }
     if compute_bec:
         # Only add `compute_bec` if it is requested
-        # We check if the model is MACELES at the start of the run function
+        # We check if the model supports BEC at the start of the run function
         forward_args["compute_bec"] = compute_bec
     return model(batch, **forward_args)
 
@@ -138,8 +138,8 @@ def run(args: argparse.Namespace) -> None:
 
     # Load model
     model = torch.load(f=args.model, map_location=args.device)
-    if model.__class__.__name__ != "MACELES" and args.compute_bec:
-        raise ValueError("BEC can only be computed with MACELES model. ")
+    if model.__class__.__name__ not in ["MACELES", "MACESOG"] and args.compute_bec:
+        raise ValueError("BEC can only be computed with MACELES or MACESOG model. ")
     if args.enable_cueq:
         print("Converting models to CuEq for acceleration")
         model = run_e3nn_to_cueq(model, device=device)

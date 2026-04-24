@@ -140,6 +140,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "ScaleShiftMACE",
             "PolarMACE",
             "MACELES",
+            "MACESOG",
             "ScaleShiftBOTNet",
             "AtomicDipolesMACE",
             "AtomicDielectricMACE",
@@ -513,6 +514,13 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--les_arguments",
         help="Path to the LES arguments file",
+        type=read_yaml,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
+        "--sog_arguments",
+        help="Path to the SOG arguments file",
         type=read_yaml,
         default=None,
         required=False,

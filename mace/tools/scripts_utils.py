@@ -225,8 +225,15 @@ def print_git_commit():
 
 
 def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
-    if model.__class__.__name__ not in ["ScaleShiftMACE", "MACELES", "PolarMACE"]:
-        return {"error": "Model is not a ScaleShiftMACE, MACELES, or PolarMACE model"}
+    if model.__class__.__name__ not in [
+        "ScaleShiftMACE",
+        "MACELES",
+        "MACESOG",
+        "PolarMACE",
+    ]:
+        return {
+            "error": "Model is not a ScaleShiftMACE, MACELES, MACESOG, or PolarMACE model"
+        }
 
     def radial_to_name(radial_type):
         if radial_type == "BesselBasis":
