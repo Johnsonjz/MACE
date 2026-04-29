@@ -477,11 +477,8 @@ class MACESOG(ScaleShiftMACE):
             cell=cell_sog.view(-1, 3, 3),
             batch=data["batch"],
             compute_energy=True,
-            compute_force=False,
-            compute_virial=False,
             compute_bec=(compute_bec or self.compute_bec),
             bec_output_index=self.bec_output_index,
-            use_explicit_derivatives=use_explicit_derivatives,
         )
         sog_energy_opt = sog_result["E_lr"]
         if sog_energy_opt is None:
@@ -489,38 +486,6 @@ class MACESOG(ScaleShiftMACE):
         else:
             sog_energy = sog_energy_opt
         total_energy += sog_energy
-
-        sog_forces: Optional[torch.Tensor] = None
-        sog_virials: Optional[torch.Tensor] = None
-        base_forces: Optional[torch.Tensor] = None
-        base_virials: Optional[torch.Tensor] = None
-        used_explicit_derivatives_out: Optional[torch.Tensor] = None
-
-        if compute_extra_force_virial:
-            sog_extra_result = self.sog(
-                latent_charges=sog_q.detach(),
-                positions=positions.detach(),
-                cell=cell_sog.view(-1, 3, 3).detach(),
-                batch=data["batch"].detach(),
-                compute_energy=True,
-                compute_force=compute_force,
-                compute_virial=(compute_virials or compute_stress),
-                compute_bec=False,
-                use_explicit_derivatives=use_explicit_derivatives,
-            )
-            if compute_force or compute_virials or compute_stress:
-                sog_forces = sog_extra_result["forces"]
-            if compute_virials or compute_stress:
-                sog_virials = sog_extra_result["virial"]
-            used_explicit_derivatives_out = torch.tensor(
-                [
-                    1.0
-                    if bool(sog_extra_result["used_explicit_derivatives"])
-                    else 0.0
-                ],
-                dtype=vectors.dtype,
-                device=vectors.device,
-            )
 
         forces, virials, stress, hessian, edge_forces = get_outputs(
             energy=inter_e + sog_energy,
@@ -535,11 +500,6 @@ class MACESOG(ScaleShiftMACE):
             compute_hessian=compute_hessian,
             compute_edge_forces=compute_edge_forces,
         )
-
-        if forces is not None and sog_forces is not None:
-            base_forces = forces - sog_forces
-        if virials is not None and sog_virials is not None:
-            base_virials = virials - sog_virials
 
         atomic_virials: Optional[torch.Tensor] = None
         atomic_stresses: Optional[torch.Tensor] = None
@@ -567,11 +527,11 @@ class MACESOG(ScaleShiftMACE):
             "sog_energy": sog_energy,
             "latent_charges": sog_q,
             "BEC": sog_result["BEC"],
-            "sog_forces": sog_forces,
-            "sog_virials": sog_virials,
-            "base_forces": base_forces,
-            "base_virials": base_virials,
-            "sog_used_explicit_derivatives": used_explicit_derivatives_out,
+            "sog_forces": None,
+            "sog_virials": None,
+            "base_forces": None,
+            "base_virials": None,
+            "sog_used_explicit_derivatives": None,
         }
 
 

@@ -912,6 +912,22 @@ def get_params_options(
                 "weight_decay": 0.0,
             }
         )
+    if hasattr(model, "sog_readouts") and model.sog_readouts is not None:
+        param_options["params"].append(
+            {
+                "name": "sog_readouts",
+                "params": model.sog_readouts.parameters(),
+                "weight_decay": 0.0,
+            }
+        )
+    if hasattr(model, "sog") and model.sog is not None:
+        param_options["params"].append(
+            {
+                "name": "sog",
+                "params": model.sog.parameters(),
+                "weight_decay": 0.0,
+            }
+        )
     return param_options
 
 
