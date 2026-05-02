@@ -317,7 +317,10 @@ class MACESOG(ScaleShiftMACE):
 
         self.compute_bec = bool(sog_arguments.get("compute_bec", False))
         self.bec_output_index = sog_arguments.get("bec_output_index", None)
-        self.sog = Sog(sog_arguments=sog_arguments)
+        self.sog = Sog(
+            sog_arguments=sog_arguments,
+            r_cut=sog_arguments.get("r_cut", None),
+        )
         self.sog_readouts = torch.nn.ModuleList()
         self.readout_input_dims = [
             _get_readout_input_dim(readout) for readout in self.readouts  # type: ignore
