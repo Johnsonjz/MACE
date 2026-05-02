@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+*.dylib
+*.dll
 
 # Distribution / packaging
 build/
@@ -12,6 +15,14 @@ build/
 
 # mypy
 .mypy_cache/
+.ruff_cache/
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+.python-version
 
 # IDE
 .idea/
