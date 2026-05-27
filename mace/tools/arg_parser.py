@@ -125,6 +125,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "DipoleMAE",
             "DipolePolarRMSE",
             "EnergyDipoleRMSE",
+            "EnergyForcesMagmomsRMSE",
         ],
         default="PerAtomRMSE",
     )
@@ -430,6 +431,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
     )
+    parser.add_argument(
+        "--compute_magmoms",
+        help="Select True to compute atomic magnetic moments",
+        type=str2bool,
+        default=False,
+    )
 
     # Dataset
     parser.add_argument(
@@ -672,6 +679,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=DefaultKeys.FORCES.value,
     )
     parser.add_argument(
+        "--magmoms_key",
+        help="Key of reference atomic magnetic moments in training xyz",
+        type=str,
+        default=DefaultKeys.MAGMOMS.value,
+    )
+    parser.add_argument(
         "--virials_key",
         help="Key of reference virials in training xyz",
         type=str,
@@ -771,6 +784,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "huber",
             "universal",
             "energy_forces_dipole",
+            "energy_forces_magmoms",
             "l1l2energyforces",
         ],
     )
@@ -822,12 +836,26 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--dipole_weight", help="weight of dipoles loss", type=float, default=1.0
     )
     parser.add_argument(
+        "--magmoms_weight",
+        help="weight of atomic magnetic moments loss",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
         "--swa_dipole_weight",
         "--stage_two_dipole_weight",
         help="weight of dipoles after starting Stage Two (previously called swa)",
         type=float,
         default=1.0,
         dest="swa_dipole_weight",
+    )
+    parser.add_argument(
+        "--swa_magmoms_weight",
+        "--stage_two_magmoms_weight",
+        help="weight of atomic magnetic moments after starting Stage Two (previously called swa)",
+        type=float,
+        default=1.0,
+        dest="swa_magmoms_weight",
     )
     parser.add_argument(
         "--swa_polarizability_weight",
@@ -1188,6 +1216,12 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         help="Key of reference forces in training xyz",
         type=str,
         default=DefaultKeys.FORCES.value,
+    )
+    parser.add_argument(
+        "--magmoms_key",
+        help="Key of reference atomic magnetic moments in training xyz",
+        type=str,
+        default=DefaultKeys.MAGMOMS.value,
     )
     parser.add_argument(
         "--virials_key",

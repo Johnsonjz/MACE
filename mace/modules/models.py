@@ -80,6 +80,7 @@ class MACE(torch.nn.Module):
         lammps_mliap: Optional[bool] = False,
         readout_cls: Optional[Type[NonLinearReadoutBlock]] = NonLinearReadoutBlock,
         keep_last_layer_irreps: bool = False,
+        compute_magmoms: bool = False,
     ):
         super().__init__()
         self.register_buffer(
@@ -104,6 +105,7 @@ class MACE(torch.nn.Module):
         self.use_so3 = use_so3
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
+        self.compute_magmoms = bool(compute_magmoms)
 
         # Embedding
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
@@ -167,7 +169,9 @@ class MACE(torch.nn.Module):
         # Interactions and readout
         self.atomic_energies_fn = AtomicEnergiesBlock(atomic_energies)
         if num_interactions == 1:
-            hidden_irreps_out = str(hidden_irreps[0])
+            hidden_irreps_out = (
+                hidden_irreps if self.compute_magmoms else str(hidden_irreps[0])
+            )
         else:
             hidden_irreps_out = hidden_irreps
         edge_irreps_first = None
@@ -206,6 +210,24 @@ class MACE(torch.nn.Module):
             use_agnostic_product=use_agnostic_product,
         )
         self.products = torch.nn.ModuleList([prod])
+
+        first_product_irreps = (
+            hidden_irreps_out
+            if isinstance(hidden_irreps_out, o3.Irreps)
+            else o3.Irreps(hidden_irreps_out)
+        )
+        if self.compute_magmoms:
+            if first_product_irreps.count(o3.Irrep("1o")) <= 0:
+                raise ValueError(
+                    "compute_magmoms=True requires at least one 1o channel in "
+                    "the first interaction product irreps."
+                )
+            self.magmom_readout = LinearDipoleReadoutBlock(
+                first_product_irreps,
+                dipole_only=True,
+                cueq_config=cueq_config,
+                oeq_config=oeq_config,
+            )
 
         self.readouts = torch.nn.ModuleList()
         if not use_last_readout_only:
@@ -359,6 +381,7 @@ class MACE(torch.nn.Module):
         energies = [e0, pair_energy]
         node_energies_list = [node_e0, pair_node_energy]
         node_feats_concat: List[torch.Tensor] = []
+        magmoms: Optional[torch.Tensor] = None
 
         for i, (interaction, product) in enumerate(
             zip(self.interactions, self.products)
@@ -383,6 +406,11 @@ class MACE(torch.nn.Module):
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
             node_feats_concat.append(node_feats)
+
+        if hasattr(self, "magmom_readout") and len(node_feats_concat) > 0:
+            magmoms = self.magmom_readout(node_feats_concat[0])[num_atoms_arange].squeeze(
+                -1
+            )
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
@@ -436,6 +464,7 @@ class MACE(torch.nn.Module):
             "displacement": displacement,
             "hessian": hessian,
             "node_feats": node_feats_out,
+            "magmoms": magmoms,
         }
 
 
@@ -539,6 +568,7 @@ class ScaleShiftMACE(MACE):
         # Interactions
         node_es_list = [pair_node_energy]
         node_feats_list: List[torch.Tensor] = []
+        magmoms: Optional[torch.Tensor] = None
 
         for i, (interaction, product) in enumerate(
             zip(self.interactions, self.products)
@@ -563,6 +593,11 @@ class ScaleShiftMACE(MACE):
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
             node_feats_list.append(node_feats)
+
+        if hasattr(self, "magmom_readout") and len(node_feats_list) > 0:
+            magmoms = self.magmom_readout(node_feats_list[0])[num_atoms_arange].squeeze(
+                -1
+            )
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
@@ -618,6 +653,7 @@ class ScaleShiftMACE(MACE):
             "hessian": hessian,
             "displacement": displacement,
             "node_feats": node_feats_out,
+            "magmoms": magmoms,
         }
 
 

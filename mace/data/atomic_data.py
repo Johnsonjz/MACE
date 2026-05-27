@@ -36,6 +36,7 @@ class AtomicData(torch_geometric.data.Data):
     energy: torch.Tensor
     stress: torch.Tensor
     virials: torch.Tensor
+    magmoms: torch.Tensor
     dipole: torch.Tensor
     charges: torch.Tensor
     polarizability: torch.Tensor
@@ -46,6 +47,7 @@ class AtomicData(torch_geometric.data.Data):
     forces_weight: torch.Tensor
     stress_weight: torch.Tensor
     virials_weight: torch.Tensor
+    magmoms_weight: torch.Tensor
     dipole_weight: torch.Tensor
     charges_weight: torch.Tensor
     polarizability_weight: torch.Tensor
@@ -69,6 +71,7 @@ class AtomicData(torch_geometric.data.Data):
         forces_weight: Optional[torch.Tensor],  # [,]
         stress_weight: Optional[torch.Tensor],  # [,]
         virials_weight: Optional[torch.Tensor],  # [,]
+        magmoms_weight: Optional[torch.Tensor],  # [,]
         dipole_weight: Optional[torch.Tensor],  # [,]
         charges_weight: Optional[torch.Tensor],  # [,]
         polarizability_weight: Optional[torch.Tensor],  # [,]
@@ -76,6 +79,7 @@ class AtomicData(torch_geometric.data.Data):
         energy: Optional[torch.Tensor],  # [, ]
         stress: Optional[torch.Tensor],  # [1,3,3]
         virials: Optional[torch.Tensor],  # [1,3,3]
+        magmoms: Optional[torch.Tensor],  # [n_nodes, 3]
         dipole: Optional[torch.Tensor],  # [, 3]
         charges: Optional[torch.Tensor],  # [n_nodes, ]
         polarizability: Optional[torch.Tensor],  # [1, 3, 3]
@@ -104,6 +108,7 @@ class AtomicData(torch_geometric.data.Data):
         assert forces_weight is None or len(forces_weight.shape) == 0
         assert stress_weight is None or len(stress_weight.shape) == 0
         assert virials_weight is None or len(virials_weight.shape) == 0
+        assert magmoms_weight is None or len(magmoms_weight.shape) == 0
         assert dipole_weight is None or dipole_weight.shape == (1, 3), dipole_weight
         assert charges_weight is None or len(charges_weight.shape) == 0
         assert cell is None or cell.shape == (3, 3)
@@ -111,6 +116,7 @@ class AtomicData(torch_geometric.data.Data):
         assert energy is None or len(energy.shape) == 0
         assert stress is None or stress.shape == (1, 3, 3)
         assert virials is None or virials.shape == (1, 3, 3)
+        assert magmoms is None or magmoms.shape == (num_nodes, 3)
         assert dipole is None or dipole.shape[-1] == 3
         assert charges is None or charges.shape == (num_nodes,)
         assert elec_temp is None or len(elec_temp.shape) == 0
@@ -141,6 +147,7 @@ class AtomicData(torch_geometric.data.Data):
             "forces_weight": forces_weight,
             "stress_weight": stress_weight,
             "virials_weight": virials_weight,
+            "magmoms_weight": magmoms_weight,
             "dipole_weight": dipole_weight,
             "charges_weight": charges_weight,
             "polarizability_weight": polarizability_weight,
@@ -148,6 +155,7 @@ class AtomicData(torch_geometric.data.Data):
             "energy": energy,
             "stress": stress,
             "virials": virials,
+            "magmoms": magmoms,
             "dipole": dipole,
             "charges": charges,
             "polarizability": polarizability,
@@ -239,6 +247,14 @@ class AtomicData(torch_geometric.data.Data):
             else torch.tensor(1.0, dtype=torch.get_default_dtype())
         )
 
+        magmoms_weight = (
+            torch.tensor(
+                config.property_weights.get("magmoms"), dtype=torch.get_default_dtype()
+            )
+            if config.property_weights.get("magmoms") is not None
+            else torch.tensor(1.0, dtype=torch.get_default_dtype())
+        )
+
         dipole_weight = (
             torch.tensor(
                 config.property_weights.get("dipole"), dtype=torch.get_default_dtype()
@@ -309,6 +325,13 @@ class AtomicData(torch_geometric.data.Data):
             ).unsqueeze(0)
             if config.properties.get("virials") is not None
             else torch.zeros(1, 3, 3, dtype=torch.get_default_dtype())
+        )
+        magmoms = (
+            torch.tensor(
+                config.properties.get("magmoms"), dtype=torch.get_default_dtype()
+            )
+            if config.properties.get("magmoms") is not None
+            else torch.zeros(num_atoms, 3, dtype=torch.get_default_dtype())
         )
         dipole = (
             torch.tensor(
@@ -409,6 +432,7 @@ class AtomicData(torch_geometric.data.Data):
             forces_weight=forces_weight,
             stress_weight=stress_weight,
             virials_weight=virials_weight,
+            magmoms_weight=magmoms_weight,
             dipole_weight=dipole_weight,
             charges_weight=charges_weight,
             polarizability_weight=polarizability_weight,
@@ -416,6 +440,7 @@ class AtomicData(torch_geometric.data.Data):
             energy=energy,
             stress=stress,
             virials=virials,
+            magmoms=magmoms,
             dipole=dipole,
             charges=charges,
             elec_temp=elec_temp,

@@ -25,6 +25,8 @@ def configure_model(
     # Selecting outputs
     compute_virials = args.loss == "virials"
     compute_stress = args.loss in ("stress", "huber", "universal")
+    if args.loss == "energy_forces_magmoms":
+        args.error_table = "EnergyForcesMagmomsRMSE"
 
     if compute_virials:
         args.compute_virials = True
@@ -39,6 +41,7 @@ def configure_model(
         "virials": compute_virials,
         "stress": compute_stress,
         "dipoles": args.compute_dipole,
+        "magmoms": args.compute_magmoms,
         "polarizabilities": args.compute_polarizability,
     }
     logging.info(
@@ -88,6 +91,7 @@ def configure_model(
         logging.info("Loading FOUNDATION model")
         model_config_foundation = extract_config_mace_model(model_foundation)
         model_config_foundation["atomic_energies"] = atomic_energies
+        model_config_foundation["compute_magmoms"] = args.compute_magmoms
 
         if args.foundation_model_elements:
             foundation_z_table = AtomicNumberTable(
@@ -194,6 +198,7 @@ def configure_model(
             atomic_numbers=z_table.zs,
             use_reduced_cg=args.use_reduced_cg,
             use_so3=args.use_so3,
+            compute_magmoms=args.compute_magmoms,
             cueq_config=cueq_config,
         )
         model_config_foundation = None

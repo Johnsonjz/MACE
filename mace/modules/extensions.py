@@ -193,6 +193,7 @@ class MACELES(ScaleShiftMACE):
         node_es_list = [pair_node_energy]
         node_feats_list: List[torch.Tensor] = []
         node_qs_list: List[torch.Tensor] = []
+        magmoms: Optional[torch.Tensor] = None
 
         for i, (interaction, product) in enumerate(
             zip(self.interactions, self.products)
@@ -217,6 +218,11 @@ class MACELES(ScaleShiftMACE):
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
             node_feats_list.append(node_feats)
+
+        if hasattr(self, "magmom_readout") and len(node_feats_list) > 0:
+            magmoms = self.magmom_readout(node_feats_list[0])[num_atoms_arange].squeeze(
+                -1
+            )
 
         for i, (readout, les_readout) in enumerate(
             zip(self.readouts, self.les_readouts)
@@ -296,6 +302,7 @@ class MACELES(ScaleShiftMACE):
             "les_energy": les_energy,
             "latent_charges": les_q,
             "BEC": les_result["BEC"],
+            "magmoms": magmoms,
         }
 
 
@@ -427,6 +434,7 @@ class MACESOG(ScaleShiftMACE):
         node_es_list = [pair_node_energy]
         node_feats_list: List[torch.Tensor] = []
         node_qs_list: List[torch.Tensor] = []
+        magmoms: Optional[torch.Tensor] = None
 
         for i, (interaction, product) in enumerate(
             zip(self.interactions, self.products)
@@ -451,6 +459,11 @@ class MACESOG(ScaleShiftMACE):
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
             node_feats_list.append(node_feats)
+
+        if hasattr(self, "magmom_readout") and len(node_feats_list) > 0:
+            magmoms = self.magmom_readout(node_feats_list[0])[num_atoms_arange].squeeze(
+                -1
+            )
 
         for i, (readout, sog_readout) in enumerate(
             zip(self.readouts, self.sog_readouts)
@@ -535,6 +548,7 @@ class MACESOG(ScaleShiftMACE):
             "base_forces": None,
             "base_virials": None,
             "sog_used_explicit_derivatives": None,
+            "magmoms": magmoms,
         }
 
 

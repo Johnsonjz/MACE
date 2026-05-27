@@ -8,6 +8,7 @@ class DefaultKeys(Enum):
     FORCES = "REF_forces"
     STRESS = "REF_stress"
     VIRIALS = "REF_virials"
+    MAGMOMS = "magmoms"
     DIPOLE = "dipole"
     POLARIZABILITY = "polarizability"
     HEAD = "head"

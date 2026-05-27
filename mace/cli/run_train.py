@@ -534,18 +534,28 @@ def run(args) -> None:
         atomic_energies_dict = atomic_energies_dict_padded
 
     if args.model == "AtomicDipolesMACE":
+        if args.loss == "energy_forces_magmoms":
+            raise ValueError(
+                "energy_forces_magmoms loss is not compatible with AtomicDipolesMACE"
+            )
         atomic_energies = None
         dipole_only = True
         args.compute_dipole = True
+        args.compute_magmoms = False
         args.compute_energy = False
         args.compute_forces = False
         args.compute_virials = False
         args.compute_stress = False
         args.compute_polarizability = False
     elif args.model == "AtomicDielectricMACE":
+        if args.loss == "energy_forces_magmoms":
+            raise ValueError(
+                "energy_forces_magmoms loss is not compatible with AtomicDielectricMACE"
+            )
         atomic_energies = None
         dipole_only = False
         args.compute_dipole = True
+        args.compute_magmoms = False
         args.compute_energy = False
         args.compute_forces = False
         args.compute_virials = False
@@ -555,6 +565,7 @@ def run(args) -> None:
         dipole_only = False
         if args.model == "EnergyDipolesMACE":
             args.compute_dipole = True
+            args.compute_magmoms = False
             args.compute_energy = True
             args.compute_forces = True
             args.compute_virials = False
@@ -562,6 +573,15 @@ def run(args) -> None:
             args.compute_polarizability = False
         elif args.model == "PolarMACE" and args.loss == "energy_forces_dipole":
             args.compute_dipole = True
+            args.compute_magmoms = False
+            args.compute_energy = True
+            args.compute_forces = True
+            args.compute_virials = False
+            args.compute_stress = False
+            args.compute_polarizability = False
+        elif args.loss == "energy_forces_magmoms":
+            args.compute_dipole = False
+            args.compute_magmoms = True
             args.compute_energy = True
             args.compute_forces = True
             args.compute_virials = False
@@ -570,6 +590,7 @@ def run(args) -> None:
         else:
             args.compute_energy = True
             args.compute_dipole = False
+            args.compute_magmoms = False
             args.compute_polarizability = False
         # atomic_energies: np.ndarray = np.array(
         #     [atomic_energies_dict[z] for z in z_table.zs]

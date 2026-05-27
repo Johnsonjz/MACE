@@ -724,6 +724,12 @@ def get_loss_fn(
             forces_weight=args.forces_weight,
             dipole_weight=args.dipole_weight,
         )
+    elif args.loss == "energy_forces_magmoms":
+        loss_fn = modules.WeightedEnergyForcesMagmomsLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            magmoms_weight=args.magmoms_weight,
+        )
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
     return loss_fn
@@ -783,6 +789,15 @@ def get_swa(
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
         )
+    elif args.loss == "energy_forces_magmoms":
+        loss_fn_energy = modules.WeightedEnergyForcesMagmomsLoss(
+            energy_weight=args.swa_energy_weight,
+            forces_weight=args.swa_forces_weight,
+            magmoms_weight=args.swa_magmoms_weight,
+        )
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, magmoms weight : {args.swa_magmoms_weight} and learning rate : {args.swa_lr}"
+        )
     elif args.loss == "universal":
         loss_fn_energy = modules.UniversalLoss(
             energy_weight=args.swa_energy_weight,
@@ -838,6 +853,8 @@ def get_params_options(
             logging.info("Freezing readout weights")
             lr_params_factors["readouts_lr_factor"] = 0.0
             freeze_module(model.readouts, True)
+            if hasattr(model, "magmom_readout") and model.magmom_readout is not None:
+                freeze_module(model.magmom_readout, True)
         if args.freeze >= 6:
             logging.info("Freezing product weights")
             lr_params_factors["products_lr_factor"] = 0.0
@@ -902,6 +919,15 @@ def get_params_options(
                 "name": "embedding_readout",
                 "params": model.embedding_readout.parameters(),
                 "weight_decay": 0.0,
+            }
+        )
+    if hasattr(model, "magmom_readout") and model.magmom_readout is not None:
+        param_options["params"].append(
+            {
+                "name": "magmom_readout",
+                "params": model.magmom_readout.parameters(),
+                "weight_decay": 0.0,
+                "lr": lr_params_factors.get("readouts_lr_factor", 1.0) * args.lr,
             }
         )
     if hasattr(model, "les_readouts") and model.les_readouts is not None:

@@ -144,6 +144,13 @@ def valid_err_log(
         logging.info(
             f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A, RMSE_Mu_per_atom={error_mu:8.2f} mDebye",
         )
+    elif log_errors == "EnergyForcesMagmomsRMSE":
+        error_e = eval_metrics["rmse_e_per_atom"] * 1e3
+        error_f = eval_metrics["rmse_f"] * 1e3
+        error_m = eval_metrics["rmse_m"]
+        logging.info(
+            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A, RMSE_M={error_m:8.4f}",
+        )
 
 
 def train(
@@ -607,6 +614,9 @@ class MACELoss(Metric):
         )
         self.add_state("delta_virials", default=[], dist_reduce_fx="cat")
         self.add_state("delta_virials_per_atom", default=[], dist_reduce_fx="cat")
+        self.add_state("Ms_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("ms", default=[], dist_reduce_fx="cat")
+        self.add_state("delta_ms", default=[], dist_reduce_fx="cat")
         self.add_state("Mus_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("mus", default=[], dist_reduce_fx="cat")
         self.add_state("delta_mus", default=[], dist_reduce_fx="cat")
@@ -655,6 +665,23 @@ class MACELoss(Metric):
             )
             self.virials_computed += filter_nonzero_weight(
                 batch, self.delta_virials, batch.weight, batch.virials_weight
+            )
+        if output.get("magmoms") is not None and batch.magmoms is not None:
+            self.ms.append(batch.magmoms)
+            self.delta_ms.append(batch.magmoms - output["magmoms"])
+            self.Ms_computed += filter_nonzero_weight(
+                batch,
+                self.delta_ms,
+                batch.weight,
+                batch.magmoms_weight,
+                spread_atoms=True,
+            )
+            filter_nonzero_weight(
+                batch,
+                self.ms,
+                batch.weight,
+                batch.magmoms_weight,
+                spread_atoms=True,
             )
         if output.get("dipole") is not None and batch.dipole is not None:
             self.mus.append(batch.dipole)
@@ -739,6 +766,14 @@ class MACELoss(Metric):
             aux["rmse_virials"] = compute_rmse(delta_virials)
             aux["rmse_virials_per_atom"] = compute_rmse(delta_virials_per_atom)
             aux["q95_virials"] = compute_q95(delta_virials)
+        if self.Ms_computed:
+            ms = self.convert(self.ms)
+            delta_ms = self.convert(self.delta_ms)
+            aux["mae_m"] = compute_mae(delta_ms)
+            aux["rel_mae_m"] = compute_rel_mae(delta_ms, ms)
+            aux["rmse_m"] = compute_rmse(delta_ms)
+            aux["rel_rmse_m"] = compute_rel_rmse(delta_ms, ms)
+            aux["q95_m"] = compute_q95(delta_ms)
         if self.Mus_computed:
             mus = self.convert(self.mus)
             delta_mus = self.convert(self.delta_mus)
