@@ -529,12 +529,7 @@ class MACESOG(ScaleShiftMACE):
             "node_feats": node_feats_out,
             "sog_energy": sog_energy,
             "latent_charges": sog_q,
-            "BEC": sog_result["BEC"],
-            "sog_forces": None,
-            "sog_virials": None,
-            "base_forces": None,
-            "base_virials": None,
-            "sog_used_explicit_derivatives": None,
+            "BEC": sog_result.get("BEC", None),
         }
 
 
