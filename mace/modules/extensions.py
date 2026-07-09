@@ -317,6 +317,7 @@ class MACESOG(ScaleShiftMACE):
 
         self.compute_bec = bool(sog_arguments.get("compute_bec", False))
         self.bec_output_index = sog_arguments.get("bec_output_index", None)
+        self.charge_neutral_lambda = sog_arguments.get("charge_neutral_lambda", None)
         self.sog = Sog(
             sog_arguments=sog_arguments,
             r_cut=sog_arguments.get("r_cut", None),
