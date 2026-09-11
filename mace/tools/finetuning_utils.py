@@ -5,6 +5,27 @@ import torch
 from mace.tools.utils import AtomicNumberTable
 
 
+def _copy_readout_weights(
+    source: torch.nn.Module, target: torch.nn.Module
+) -> None:
+    """Copy weights from *source* readout to *target* readout.
+
+    Both must be the same type (LinearReadoutBlock or NonLinearReadoutBlock).
+    """
+    src_state = source.state_dict()
+    tgt_state = target.state_dict()
+    for key, src_param in src_state.items():
+        if key in tgt_state and tgt_state[key].shape == src_param.shape:
+            tgt_state[key].copy_(src_param)
+
+
+def _scale_module_weights(module: torch.nn.Module, factor: float) -> None:
+    """Multiply all Parameter weights in *module* by *factor* in-place."""
+    with torch.no_grad():
+        for param in module.parameters():
+            param.mul_(factor)
+
+
 def load_foundations_elements(
     model: torch.nn.Module,
     model_foundations: torch.nn.Module,
@@ -28,16 +49,41 @@ def load_foundations_elements(
         model_foundations.node_embedding.linear.weight.shape[0]
         // num_species_foundations
     )
-    indices_weights = [z_table.z_to_index(z) for z in new_z_table.zs]
+    # Build mapping: for each element in new_z_table, find foundation index
+    # For new elements (not in foundation), use None
+    indices_weights = []
+    new_element_mask = []  # True for new elements
+    for z in new_z_table.zs:
+        try:
+            idx = z_table.z_to_index(z)
+            indices_weights.append(idx)
+            new_element_mask.append(False)
+        except ValueError:
+            indices_weights.append(-1)  # placeholder, will be expanded
+            new_element_mask.append(True)
     num_radial = model.radial_embedding.out_dim
     num_species = len(indices_weights)
     max_ell = model.spherical_harmonics._lmax  # pylint: disable=protected-access
+
+    # Helper: expand foundation weights to include new elements
+    # foundation_weights shape: (num_species_foundations, ...)
+    # Returns expanded weights of shape (num_species, ...)
+    def _expand_species_weights(foundation_weights):
+        """Expand species-dependent weights, using mean for new elements."""
+        flat = foundation_weights.reshape(num_species_foundations, -1)
+        mean_w = flat.mean(dim=0)
+        expanded = []
+        for i in range(num_species):
+            if new_element_mask[i]:
+                expanded.append(mean_w.clone())
+            else:
+                expanded.append(flat[indices_weights[i]].clone())
+        return torch.stack(expanded)
+
+    # Node embedding
+    foundation_node = model_foundations.node_embedding.linear.weight
     model.node_embedding.linear.weight = torch.nn.Parameter(
-        model_foundations.node_embedding.linear.weight.view(
-            num_species_foundations, -1
-        )[indices_weights, :]
-        .flatten()
-        .clone()
+        _expand_species_weights(foundation_node).flatten()
         / (num_species_foundations / num_species) ** 0.5
     )
     if hasattr(model, "joint_embedding"):
@@ -76,7 +122,7 @@ def load_foundations_elements(
             if param_1.shape == param_2.shape:
                 param_1.data.copy_(param_2.data)
             else:
-                param_1.data.copy_(param_2.data[: (num_radial + 2 * num_species), ...])
+                param_1.data.copy_(param_2.data[: (num_radial + 2 * num_species_foundations), ...])
         if hasattr(model.interactions[i], "linear"):
             model.interactions[i].linear.weight = torch.nn.Parameter(
                 model_foundations.interactions[i].linear.weight.clone()
@@ -94,23 +140,15 @@ def load_foundations_elements(
                 model_foundations.interactions[i].linear_res.weight.clone()
             )
         if hasattr(model.interactions[i], "source_embedding"):
+            src_w = model_foundations.interactions[i].source_embedding.weight
             model.interactions[i].source_embedding.weight = torch.nn.Parameter(
-                model_foundations.interactions[i]
-                .source_embedding.weight.view(num_species_foundations, -1)[
-                    indices_weights, :
-                ]
-                .flatten()
-                .clone()
+                _expand_species_weights(src_w).flatten()
                 / (num_species_foundations / num_species) ** 0.5
             )
         if hasattr(model.interactions[i], "target_embedding"):
+            tgt_w = model_foundations.interactions[i].target_embedding.weight
             model.interactions[i].target_embedding.weight = torch.nn.Parameter(
-                model_foundations.interactions[i]
-                .target_embedding.weight.view(num_species_foundations, -1)[
-                    indices_weights, :
-                ]
-                .flatten()
-                .clone()
+                _expand_species_weights(tgt_w).flatten()
                 / (num_species_foundations / num_species) ** 0.5
             )
         if hasattr(model.interactions[i], "alpha"):
@@ -126,13 +164,15 @@ def load_foundations_elements(
             "RealAgnosticDensityResidualInteractionBlock",
         ]:
             model.interactions[i].skip_tp.weight = torch.nn.Parameter(
-                model_foundations.interactions[i]
-                .skip_tp.weight.reshape(
-                    num_channels_foundation,
-                    num_species_foundations,
-                    num_channels_foundation,
-                )[:, indices_weights, :]
-                .flatten()
+                _expand_species_weights(
+                    model_foundations.interactions[i]
+                    .skip_tp.weight.reshape(
+                        num_channels_foundation,
+                        num_species_foundations,
+                        num_channels_foundation,
+                    )
+                )
+                .reshape(-1)
                 .clone()
                 / (num_species_foundations / num_species) ** 0.5
             )
@@ -192,6 +232,32 @@ def load_foundations_elements(
         product.linear.weight = torch.nn.Parameter(
             model_foundations.products[i].linear.weight.clone()
         )
+
+        # Copy U_matrix buffers (CG coefficients) from foundation.
+        # These are static buffers computed during __init__; they may differ
+        # between code versions (e.g. different sympy/e3nn CG decompositions).
+        # The weights were trained with the foundation's U_matrices, so they
+        # must match.
+        for j in range(max_range):
+            new_ct = product.symmetric_contractions.contractions[j]
+            found_ct = (
+                model_foundations.products[i]
+                .symmetric_contractions.contractions[j]
+            )
+            # Copy buffers (U_matrix_1, U_matrix_2, U_matrix_3, ...)
+            for buf_name, found_buf in found_ct.named_buffers():
+                if hasattr(new_ct, buf_name):
+                    new_buf = getattr(new_ct, buf_name)
+                    if new_buf.shape == found_buf.shape:
+                        new_buf.copy_(found_buf)
+                    else:
+                        # Shape mismatch – replace the buffer wholesale
+                        new_ct.register_buffer(
+                            buf_name, found_buf.clone().detach()
+                        )
+            # Replace compiled graph module to match buffer dimensions
+            if hasattr(found_ct, "graph_opt_main"):
+                new_ct.graph_opt_main = found_ct.graph_opt_main
 
     if load_readout:
         # Transferring readouts
@@ -290,7 +356,29 @@ def load_foundations_elements(
                         readout.linear_2.bias = torch.nn.Parameter(
                             model_readouts_one_linear_2_bias
                         )
-    _handled_attrs = {"interactions", "products", "readouts"}
+    # Copy readout weights to sog_readouts (if present).
+    # sog_readouts are created as architectural copies of readouts during
+    # MACESOG.__init__ but with random weights.  We seed them from the
+    # foundation's readout weights so the initial charge predictions are
+    # non-zero, then scale down (energy readout outputs eV, charges should
+    # be ~0.01-0.1 e), breaking the q≈0 deadlock while keeping SOG stable.
+    if hasattr(model, "sog_readouts"):
+        for i, (readout, sog_readout) in enumerate(
+            zip(model.readouts, model.sog_readouts)
+        ):
+            # If sog_readout is wrapped (e.g. by AddBiasWrapper), unwrap to
+            # copy weights into the underlying readout block.
+            target = sog_readout
+            if hasattr(target, "base"):
+                target = target.base
+            _copy_readout_weights(readout, target)
+            # Scale down: energy readouts produce eV, charges should be ~0.01-0.1 e.
+            # A scale factor of 0.01 maps typical atomic energies (1-10 eV) to
+            # charges (0.01-0.1 e), which is physically reasonable.
+            _scale_module_weights(target, 0.01)
+
+    _handled_attrs = {"interactions", "products", "readouts", "sog", "sog_readouts",
+                       "per_element_charge_shift", "hardness", "chi_bias"}
     for attr_name, module in model.named_children():
         if attr_name in _handled_attrs:
             continue
@@ -337,6 +425,11 @@ def load_foundations_elements(
         if name not in model_state:
             continue
         if not load_readout and name.startswith("readouts."):
+            continue
+        # sog_readouts are handled separately in model_script_utils.py with the
+        # correct use_qeq logic (χ vs direct-charge readout); copying them here
+        # would overwrite the charge readout with the foundation's χ readout.
+        if name.startswith("sog_readouts."):
             continue
         if model_state[name].shape != param.shape:
             continue

@@ -141,6 +141,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "PolarMACE",
             "MACELES",
             "MACESOG",
+            "ZeroInteractionMPASOG",
             "ScaleShiftBOTNet",
             "AtomicDipolesMACE",
             "AtomicDielectricMACE",
@@ -930,6 +931,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Gamma of learning rate scheduler",
         type=float,
         default=0.9993,
+    )
+    parser.add_argument(
+        "--lr_cosine_t_max",
+        help="T_max for CosineAnnealingLR (epochs to decay over). Defaults to max_num_epochs.",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--lr_cosine_eta_min",
+        help="eta_min (minimum LR) for CosineAnnealingLR. Defaults to max(lr/10, 1e-6).",
+        type=float,
+        default=None,
     )
     parser.add_argument(
         "--swa",

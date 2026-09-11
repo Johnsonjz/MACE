@@ -1,6 +1,8 @@
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 from e3nn import o3
 from e3nn.util.jit import compile_mode
 
@@ -31,6 +33,8 @@ from mace.modules.wrapper_ops import (
 )
 from mace.tools.scatter import scatter_mean, scatter_sum
 
+from .qeq import build_sog_kernel, qeq_equilibrate, qeq_equilibrate_direct
+
 from .field_blocks import (
     EnvironmentDependentSpinSourceBlock,
     MultiLayerFeatureMixer,
@@ -41,15 +45,20 @@ from .utils import compute_total_charge_dipole_permuted
 
 
 def _copy_mace_readout(
-    mace_readout: torch.nn.Module, cueq_config: Optional[CuEquivarianceConfig] = None
+    mace_readout: torch.nn.Module,
+    latent_charge_dim: int = 1,
+    cueq_config: Optional[CuEquivarianceConfig] = None,
 ) -> torch.nn.Module:
     """
-    Helper function to copy a MACE readout block.
+    Helper function to copy a MACE readout block, with the output multiplicity
+    set to ``latent_charge_dim`` (per-atom latent-charge dimension).  The SOG
+    charge readout therefore emits ``[n_atoms, latent_charge_dim]`` directly.
     """
+    irrep_out = o3.Irreps(f"{latent_charge_dim}x0e")
     if isinstance(mace_readout, LinearReadoutBlock):
         return LinearReadoutBlock(
             irreps_in=mace_readout.linear.irreps_in,  # type: ignore
-            irrep_out=mace_readout.linear.irreps_out,  # type: ignore
+            irrep_out=irrep_out,
             cueq_config=cueq_config,
         )
     if isinstance(mace_readout, NonLinearReadoutBlock):  # type: ignore
@@ -59,7 +68,7 @@ def _copy_mace_readout(
             gate=mace_readout.non_linearity._modules["acts"][  # pylint: disable=W0212
                 0
             ].f,
-            irrep_out=mace_readout.linear_2.irreps_out,  # type: ignore
+            irrep_out=irrep_out,
             num_heads=mace_readout.num_heads,
             cueq_config=cueq_config,
         )
@@ -221,7 +230,7 @@ class MACELES(ScaleShiftMACE):
         for i, (readout, les_readout) in enumerate(
             zip(self.readouts, self.les_readouts)
         ):
-            feat_idx = -1 if len(self.readouts) == 1 else i
+            feat_idx = min(i, len(node_feats_list) - 1)
             node_es = readout(node_feats_list[feat_idx], node_heads)[
                 num_atoms_arange, node_heads
             ]
@@ -322,6 +331,13 @@ class MACESOG(ScaleShiftMACE):
             sog_arguments=sog_arguments,
             r_cut=sog_arguments.get("r_cut", None),
         )
+        # Per-atom latent-charge dimension (default 1: a scalar charge per
+        # particle).  Configurable via sog_arguments["latent_charge_dim"].
+        self.latent_charge_dim = int(sog_arguments.get("latent_charge_dim", 1))
+        if self.latent_charge_dim < 1:
+            raise ValueError(
+                f"latent_charge_dim must be a positive integer, got {self.latent_charge_dim}"
+            )
         self.sog_readouts = torch.nn.ModuleList()
         self.readout_input_dims = [
             _get_readout_input_dim(readout) for readout in self.readouts  # type: ignore
@@ -329,8 +345,66 @@ class MACESOG(ScaleShiftMACE):
         cueq_config = kwargs.get("cueq_config", None)
         for readout in self.readouts:  # type: ignore
             self.sog_readouts.append(
-                _copy_mace_readout(readout, cueq_config=cueq_config)
+                _copy_mace_readout(
+                    readout,
+                    latent_charge_dim=self.latent_charge_dim,
+                    cueq_config=cueq_config,
+                )
             )
+
+        # ── QEq charge equilibration (optional) ─────────────────────
+        qeq_config = sog_arguments.get("qeq", None)
+        self.use_qeq = bool(qeq_config is not None and qeq_config.get("enabled", True))
+        if self.use_qeq and self.latent_charge_dim != 1:
+            raise ValueError(
+                f"QEq requires latent_charge_dim=1 (scalar electronegativity χ "
+                f"per atom), got {self.latent_charge_dim}"
+            )
+        if self.use_qeq:
+            from mace.modules.qeq import (
+                ElementHardness,
+                PerElementChiBias,
+                build_hardness,
+            )
+
+            self.qeq_iters = int(qeq_config.get("iters", 15))
+            self.qeq_mixing = float(qeq_config.get("mixing", 0.5))
+            self.qeq_solver = str(qeq_config.get("solver", "direct")).lower().strip()
+            if self.qeq_solver not in ("direct", "cg"):
+                raise ValueError(f"Unknown qeq.solver: '{self.qeq_solver}'")
+            hardness_override = qeq_config.get("hardness", None)
+            if isinstance(hardness_override, dict):
+                hardness_override = {
+                    int(k): float(v) for k, v in hardness_override.items()
+                }
+            self.hardness = ElementHardness(
+                build_hardness(
+                    self.atomic_numbers,
+                    hardness_default=float(qeq_config.get("hardness_default", 5.0)),
+                    hardness_override=hardness_override,
+                )
+            )
+            chi_init = str(qeq_config.get("chi_init", "none")).lower().strip()
+            if chi_init == "mulliken":
+                self.chi_bias = PerElementChiBias(self.atomic_numbers)
+            elif chi_init == "none":
+                self.chi_bias = None
+            else:
+                raise ValueError(f"Unknown qeq.chi_init: '{chi_init}'")
+        else:
+            self.qeq_iters = 0
+            self.qeq_mixing = 0.5
+            self.qeq_solver = "cg"
+            self.hardness = None
+            self.chi_bias = None
+
+        # ── Charge initialisation (direct-charge path only) ─────────
+        charge_init_config = sog_arguments.get("charge_init", None)
+        if charge_init_config is not None and not self.use_qeq:
+            from mace.modules.charge_init import ChargeInitializer
+
+            charge_init = ChargeInitializer.create(charge_init_config)
+            charge_init.initialize(self.sog_readouts, self.atomic_numbers, self)
 
     def forward(
         self,
@@ -456,13 +530,13 @@ class MACESOG(ScaleShiftMACE):
         for i, (readout, sog_readout) in enumerate(
             zip(self.readouts, self.sog_readouts)
         ):
-            feat_idx = -1 if len(self.readouts) == 1 else i
+            feat_idx = min(i, len(node_feats_list) - 1)
             node_es = readout(node_feats_list[feat_idx], node_heads)[
                 num_atoms_arange, node_heads
             ]
-            node_qs = sog_readout(node_feats_list[feat_idx], node_heads)[
-                num_atoms_arange, node_heads
-            ]  # type: ignore
+            # Charge readout emits [n_atoms, latent_charge_dim] directly; the
+            # head dimension is folded into the charge dim (not head-selected).
+            node_qs = sog_readout(node_feats_list[feat_idx], node_heads)  # type: ignore
             node_qs_list.append(node_qs)
             node_es_list.append(node_es)
 
@@ -474,25 +548,122 @@ class MACESOG(ScaleShiftMACE):
         total_energy = e0 + inter_e
         node_energy = node_e0.clone().double() + node_inter_es.clone().double()
 
-        sog_q = torch.sum(torch.stack(node_qs_list, dim=1), dim=1)
-        sog_result = self.sog(
-            latent_charges=sog_q,
-            positions=positions,
-            cell=cell_sog.view(-1, 3, 3),
-            batch=data["batch"],
-            compute_energy=True,
-            compute_bec=(compute_bec or self.compute_bec),
-            bec_output_index=self.bec_output_index,
-        )
-        sog_energy_opt = sog_result["E_lr"]
-        if sog_energy_opt is None:
-            sog_energy = torch.zeros_like(total_energy)
+        if self.use_qeq:
+            # ── QEq charge equilibration ──────────────────────────────
+            # χ must be a scalar per atom (electronegativity).  QEq forces
+            # latent_charge_dim=1, so the readout stack is [n_atoms, 1]; squeeze.
+            chi = torch.sum(torch.stack(node_qs_list, dim=1), dim=1).squeeze(-1)
+            if self.chi_bias is not None:
+                chi = chi + self.chi_bias(data["node_attrs"]).squeeze(-1)
+            hardness = self.hardness(data["node_attrs"])  # [n_atoms]
+
+            if self.qeq_solver == "direct":
+                # Dense direct solve on the explicit SOG kernel — same kernel
+                # as E_lr, so the frozen-charge envelope theorem holds exactly.
+                # O(n³) LU, sub-ms for the ≤260-atom battery frames.
+                J = build_sog_kernel(
+                    positions, cell_sog.view(-1, 3, 3), data["batch"], self.sog
+                )
+                q_star = qeq_equilibrate_direct(
+                    chi, hardness, data["batch"], J
+                )  # [n_atoms, nheads], detached
+            else:
+                def potential_fn(q_leaf: torch.Tensor) -> torch.Tensor:
+                    # v = ∂E_LR/∂q, computed on a detached leaf so no graph is
+                    # built through the fixed-point iterations (frozen-charge /
+                    # envelope-theorem approximation).
+                    q_leaf = q_leaf.detach().requires_grad_(True)
+                    res = self.sog(
+                        latent_charges=q_leaf,
+                        positions=positions,
+                        cell=cell_sog.view(-1, 3, 3),
+                        batch=data["batch"],
+                        compute_energy=True,
+                        compute_bec=False,
+                    )
+                    e_lr = res["E_lr"]
+                    if e_lr is None:
+                        e_lr = torch.zeros(
+                            num_graphs, device=q_leaf.device, dtype=q_leaf.dtype
+                        )
+                    return torch.autograd.grad(e_lr.sum(), q_leaf)[0]
+
+                q_star = qeq_equilibrate(
+                    chi,
+                    hardness,
+                    data["batch"],
+                    potential_fn,
+                    iters=self.qeq_iters,
+                    mixing=self.qeq_mixing,
+                )  # [n_atoms, nheads], detached
+
+            # G_ML term: χᵀq* + ½ q*ᵀ η q* — per-atom product, scattered to
+            # per-graph [num_graphs] (dim=-1 scatter of a 1-D tensor).
+            # NOTE: chi is 1-D [n_atoms] while q_star is [n_atoms, nheads];
+            # a bare `chi * q_star` broadcasts as an OUTER PRODUCT [n_atoms,
+            # n_atoms] (left-padding [n]→[1,n] against [n,1]), which would
+            # sum each atom's term over every other atom's charge. Squeeze
+            # the head dim first so the product stays per-atom.
+            q_1d = q_star.squeeze(-1)  # [n_atoms]
+            gml = chi * q_1d + 0.5 * hardness * q_1d * q_1d
+            gml_e = scatter_sum(gml, data["batch"], dim=-1, dim_size=num_graphs)
+
+            # Long-range Coulomb energy at the equilibrium charge
+            sog_result = self.sog(
+                latent_charges=q_star,
+                positions=positions,
+                cell=cell_sog.view(-1, 3, 3),
+                batch=data["batch"],
+                compute_energy=True,
+                compute_bec=(compute_bec or self.compute_bec),
+                bec_output_index=self.bec_output_index,
+            )
+            sog_energy_opt = sog_result["E_lr"]
+            if sog_energy_opt is None:
+                sog_energy = torch.zeros_like(total_energy)
+            else:
+                sog_energy = sog_energy_opt
+            total_energy = total_energy + gml_e + sog_energy
+            forces_energy = inter_e + gml_e + sog_energy
+            latent_charges_out = q_star
+            chi_out = chi
+            hardness_out = hardness
         else:
-            sog_energy = sog_energy_opt
-        total_energy += sog_energy
+            # ── Direct charge readout (legacy) ───────────────────────
+            # sog_q is [n_atoms, latent_charge_dim] — a per-atom charge vector.
+            sog_q = torch.sum(torch.stack(node_qs_list, dim=1), dim=1)
+            # Apply per-element charge shift if configured by charge_init.
+            # pe_mod returns [n_atoms, 1]; with latent_charge_dim=1 both are
+            # [n_atoms, 1] and add cleanly — no more [n_atoms]+[n_atoms,1] →
+            # [n_atoms, n_atoms] broadcast (which SOG read as n_atoms channels).
+            if getattr(self, "_use_per_element_charge_init", False):
+                pe_mod = self.per_element_charge_shift
+                if hasattr(pe_mod, 'charge_neutral') and pe_mod.charge_neutral:
+                    sog_q = sog_q + pe_mod(data["node_attrs"], data["batch"])
+                else:
+                    sog_q = sog_q + pe_mod(data["node_attrs"])
+            sog_result = self.sog(
+                latent_charges=sog_q,
+                positions=positions,
+                cell=cell_sog.view(-1, 3, 3),
+                batch=data["batch"],
+                compute_energy=True,
+                compute_bec=(compute_bec or self.compute_bec),
+                bec_output_index=self.bec_output_index,
+            )
+            sog_energy_opt = sog_result["E_lr"]
+            if sog_energy_opt is None:
+                sog_energy = torch.zeros_like(total_energy)
+            else:
+                sog_energy = sog_energy_opt
+            total_energy += sog_energy
+            forces_energy = inter_e + sog_energy
+            latent_charges_out = sog_q
+            chi_out = None
+            hardness_out = None
 
         forces, virials, stress, hessian, edge_forces = get_outputs(
-            energy=inter_e + sog_energy,
+            energy=forces_energy,
             positions=positions,
             displacement=displacement,
             vectors=vectors,
@@ -526,6 +697,274 @@ class MACESOG(ScaleShiftMACE):
             "atomic_virials": atomic_virials,
             "atomic_stresses": atomic_stresses,
             "displacement": displacement,
+            "hessian": hessian,
+            "node_feats": node_feats_out,
+            "sog_energy": sog_energy,
+            "latent_charges": latent_charges_out,
+            "electronegativity": chi_out,
+            "hardness": hardness_out,
+            "BEC": sog_result.get("BEC", None),
+        }
+
+
+class ZeroInteractionMPASOG(ScaleShiftMACE):
+    """MPA-0 + SOG with zero message-passing layers.
+
+    Inherits ScaleShiftMACE directly (same parent as MACE-MPA-0) so it
+    naturally accepts Density interaction blocks and hidden_irreps with
+    vectors (128x0e+128x1o). Adds SOG module for long-range electrostatics.
+
+    Bypasses all interaction/product layers: node_embedding output is fed
+    directly to energy readout (sr_energy) and charge readout (latent_q).
+
+    Designed for parameter grafting:
+    - MACE-MPA-0 → descriptor (node_embedding) + sr_energy (readouts, scale_shift)
+    - Full-S2 → latent_q (sog_readouts) + sog_lib (Sog module)
+
+    Interaction and product layers are frozen and unused — they exist only
+    for MACE.__init__ compatibility.
+    """
+
+    def __init__(self, sog_arguments: Optional[Dict] = None, **kwargs):
+        # Force 1 interaction for MACE.__init__ compatibility
+        kwargs["num_interactions"] = 1
+        super().__init__(**kwargs)
+
+        # ── SOG setup (same as MACESOG) ──
+        try:
+            from sog import Sog
+        except ImportError as exc:
+            raise ImportError(
+                "Cannot import 'sog'. Please install the 'sog' library."
+            ) from exc
+
+        if sog_arguments is None:
+            sog_arguments = {"use_atomwise": False}
+        else:
+            sog_arguments = dict(sog_arguments)
+
+        self.compute_bec = bool(sog_arguments.get("compute_bec", False))
+        self.bec_output_index = sog_arguments.get("bec_output_index", None)
+        self.charge_neutral_lambda = sog_arguments.get("charge_neutral_lambda", None)
+        self.sog = Sog(
+            sog_arguments=sog_arguments,
+            r_cut=sog_arguments.get("r_cut", None),
+        )
+        # Per-atom latent-charge dimension (default 1: a scalar charge per
+        # particle).  Configurable via sog_arguments["latent_charge_dim"].
+        self.latent_charge_dim = int(sog_arguments.get("latent_charge_dim", 1))
+        if self.latent_charge_dim < 1:
+            raise ValueError(
+                f"latent_charge_dim must be a positive integer, got {self.latent_charge_dim}"
+            )
+        self.sog_readouts = torch.nn.ModuleList()
+        self.readout_input_dims = [
+            _get_readout_input_dim(readout) for readout in self.readouts
+        ]
+        cueq_config = kwargs.get("cueq_config", None)
+        for readout in self.readouts:
+            self.sog_readouts.append(
+                _copy_mace_readout(
+                    readout,
+                    latent_charge_dim=self.latent_charge_dim,
+                    cueq_config=cueq_config,
+                )
+            )
+
+        # ── Charge initialisation ────────────────────────────────────
+        charge_init_config = sog_arguments.get("charge_init", None)
+        if charge_init_config is not None:
+            from mace.modules.charge_init import ChargeInitializer
+
+            charge_init = ChargeInitializer.create(charge_init_config)
+            charge_init.initialize(self.sog_readouts, self.atomic_numbers, self)
+
+        # Freeze unused interaction/product layers
+        for p in self.interactions.parameters():
+            p.requires_grad = False
+        for p in self.products.parameters():
+            p.requires_grad = False
+
+        # Override num_interactions buffer to report 0
+        self.register_buffer(
+            "num_interactions", torch.tensor(0, dtype=torch.int64)
+        )
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+        compute_bec: bool = False,
+        compute_extra_force_virial: bool = False,
+        use_explicit_derivatives: bool = True,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # ── Setup (identical to MACESOG) ──
+        ctx = prepare_graph(
+            data,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_displacement=compute_displacement,
+            lammps_mliap=lammps_mliap,
+        )
+        is_lammps = ctx.is_lammps
+        num_atoms_arange = ctx.num_atoms_arange
+        num_graphs = ctx.num_graphs
+        positions = ctx.positions
+        vectors = ctx.vectors
+        lengths = ctx.lengths
+        cell = ctx.cell
+        node_heads = ctx.node_heads
+        interaction_kwargs = ctx.interaction_kwargs
+        lammps_natoms = interaction_kwargs.lammps_natoms
+        lammps_class = interaction_kwargs.lammps_class
+
+        # SOG cell for non-periodic
+        cell_sog = cell.clone()
+        pbc_tensor = data["pbc"].to(device=data["cell"].device)
+        no_pbc_mask_cfg = ~pbc_tensor.any(dim=-1)
+        no_pbc_mask_rows = no_pbc_mask_cfg.repeat_interleave(3)
+        cell_sog[no_pbc_mask_rows] = torch.zeros(
+            (no_pbc_mask_rows.sum(), 3), dtype=cell_sog.dtype, device=cell_sog.device
+        )
+
+        # Atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
+            num_atoms_arange, node_heads
+        ]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        ).to(vectors.dtype)
+
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats, cutoff = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+
+        # Pair repulsion
+        if hasattr(self, "pair_repulsion"):
+            pair_node_energy = self.pair_repulsion_fn(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+            if is_lammps:
+                pair_node_energy = pair_node_energy[: lammps_natoms[0]]
+        else:
+            pair_node_energy = torch.zeros_like(node_e0)
+
+        # Joint embedding
+        if hasattr(self, "joint_embedding"):
+            embedding_features: Dict[str, torch.Tensor] = {}
+            for name, _ in self.embedding_specs.items():
+                embedding_features[name] = data[name]
+            node_feats += self.joint_embedding(data["batch"], embedding_features)
+            if hasattr(self, "embedding_readout"):
+                embedding_node_energy = self.embedding_readout(
+                    node_feats, node_heads
+                ).squeeze(-1)
+                embedding_energy = scatter_sum(
+                    src=embedding_node_energy,
+                    index=data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                )
+                e0 += embedding_energy
+
+        # ── ZERO INTERACTIONS: feed embedding directly to readouts ──
+        node_es_list = [pair_node_energy]
+        node_qs_list: List[torch.Tensor] = []
+
+        for i, (readout, sog_readout) in enumerate(
+            zip(self.readouts, self.sog_readouts)
+        ):
+            node_es = readout(node_feats, node_heads)[
+                num_atoms_arange, node_heads
+            ]
+            # Charge readout emits [n_atoms, latent_charge_dim] directly (see
+            # MACESOG.forward — head dim folded into the charge dim).
+            node_qs = sog_readout(node_feats, node_heads)
+            node_qs_list.append(node_qs)
+            node_es_list.append(node_es)
+
+        node_feats_out = node_feats
+        node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
+        node_inter_es = self.scale_shift(node_inter_es, node_heads)
+        inter_e = scatter_sum(
+            node_inter_es, data["batch"], dim=-1, dim_size=num_graphs
+        )
+
+        total_energy = e0 + inter_e
+        node_energy = node_e0.clone().double() + node_inter_es.clone().double()
+
+        # sog_q is [n_atoms, latent_charge_dim]; pe_mod returns [n_atoms, 1] and
+        # with latent_charge_dim=1 both are [n_atoms, 1] (see MACESOG.forward).
+        sog_q = torch.sum(torch.stack(node_qs_list, dim=1), dim=1)
+        # Apply per-element charge shift if configured by charge_init
+        if getattr(self, "_use_per_element_charge_init", False):
+            pe_mod = self.per_element_charge_shift
+            if hasattr(pe_mod, 'charge_neutral') and pe_mod.charge_neutral:
+                sog_q = sog_q + pe_mod(data["node_attrs"], data["batch"])
+            else:
+                sog_q = sog_q + pe_mod(data["node_attrs"])
+        sog_result = self.sog(
+            latent_charges=sog_q,
+            positions=positions,
+            cell=cell_sog.view(-1, 3, 3),
+            batch=data["batch"],
+            compute_energy=True,
+            compute_bec=(compute_bec or self.compute_bec),
+            bec_output_index=self.bec_output_index,
+        )
+        sog_energy_opt = sog_result["E_lr"]
+        if sog_energy_opt is None:
+            sog_energy = torch.zeros_like(total_energy)
+        else:
+            sog_energy = sog_energy_opt
+        total_energy += sog_energy
+
+        forces, virials, stress, hessian, edge_forces = get_outputs(
+            energy=inter_e + sog_energy,
+            positions=positions,
+            displacement=ctx.displacement,
+            vectors=vectors,
+            cell=cell,
+            training=training,
+            compute_force=compute_force,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_hessian=compute_hessian,
+            compute_edge_forces=compute_edge_forces,
+        )
+
+        atomic_virials: Optional[torch.Tensor] = None
+        atomic_stresses: Optional[torch.Tensor] = None
+        if compute_atomic_stresses and edge_forces is not None:
+            atomic_virials, atomic_stresses = get_atomic_virials_stresses(
+                edge_forces=edge_forces,
+                edge_index=data["edge_index"],
+                vectors=vectors,
+                num_atoms=positions.shape[0],
+                batch=data["batch"],
+                cell=cell,
+            )
+        return {
+            "energy": total_energy,
+            "node_energy": node_energy,
+            "forces": forces,
+            "edge_forces": edge_forces,
+            "virials": virials,
+            "stress": stress,
+            "atomic_virials": atomic_virials,
+            "atomic_stresses": atomic_stresses,
+            "displacement": ctx.displacement,
             "hessian": hessian,
             "node_feats": node_feats_out,
             "sog_energy": sog_energy,

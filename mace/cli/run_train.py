@@ -873,6 +873,23 @@ def run(args) -> None:
         if opt_start_epoch is not None:
             start_epoch = opt_start_epoch
 
+    # Honor --lr on resume: load_latest restores the optimizer's saved lr, which
+    # silently discards any --lr change (e.g. lowering lr to halt force-head
+    # overfitting). Force param_groups back to args.lr so the requested lr
+    # actually takes effect when resuming a warm-started run.
+    if args.restart_latest and start_epoch > 0:
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+        logging.info(
+            f"Restarting from epoch {start_epoch}: overriding optimizer lr to {args.lr:.1e}"
+        )
+
+    # Ensure swa_lr is in optimizer param groups after checkpoint loading
+    # (checkpoint state_dict may overwrite it when loaded after SWALR creation)
+    if args.swa:
+        for group in optimizer.param_groups:
+            group.setdefault("swa_lr", args.swa_lr)
+
     ema: Optional[ExponentialMovingAverage] = None
     if args.ema:
         ema = ExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
@@ -895,7 +912,15 @@ def run(args) -> None:
     if args.wandb:
         setup_wandb(args)
     if args.distributed:
-        distributed_model = DDP(model, device_ids=[local_rank])
+        # find_unused_parameters=True: a warm-started MACESOG can have a few
+        # parameters legitimately absent from the autograd graph on a given
+        # iteration (e.g. the force readout's output layer `readouts.1.linear_2`
+        # and the SOG Gaussian `bandwidth`, both element/head-indexed paths that
+        # may not fire for every batch).  With the default False, DDP's static
+        # bucketing raises "Expected to have finished reduction in the prior
+        # iteration" the moment such a parameter misses gradient.  The extra
+        # per-iteration traversal of True is negligible at this model size.
+        distributed_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     else:
         distributed_model = None
 
@@ -1055,7 +1080,7 @@ def run(args) -> None:
             # after param.requires_grad = False was called before evaluating stage-one model
             for param in model.parameters():
                 param.requires_grad = True
-            distributed_model = DDP(model, device_ids=[local_rank])
+            distributed_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         model_to_evaluate = model if not args.distributed else distributed_model
         if swa_eval:
             logging.info(f"Loaded Stage two model from epoch {epoch} for evaluation")

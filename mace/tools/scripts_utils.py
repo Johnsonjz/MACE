@@ -17,7 +17,8 @@ import numpy as np
 import torch
 import torch.distributed
 from e3nn import o3
-from torch.optim.swa_utils import SWALR, AveragedModel
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel
 
 from mace import data, modules, tools
 from mace.data import KeySpecification
@@ -229,10 +230,11 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         "ScaleShiftMACE",
         "MACELES",
         "MACESOG",
+        "ZeroInteractionMPASOG",
         "PolarMACE",
     ]:
         return {
-            "error": "Model is not a ScaleShiftMACE, MACELES, MACESOG, or PolarMACE model"
+            "error": "Model is not a ScaleShiftMACE, MACELES, MACESOG, ZeroInteractionMPASOG, or PolarMACE model"
         }
 
     def radial_to_name(radial_type):
@@ -281,7 +283,11 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         "interaction_cls_first": model.interactions[0].__class__,
         "num_interactions": model.num_interactions.item(),
         "num_elements": len(model.atomic_numbers),
-        "hidden_irreps": o3.Irreps(str(model.products[0].linear.irreps_out)),
+        "hidden_irreps": (
+            o3.Irreps(model._hidden_irreps)
+            if hasattr(model, "_hidden_irreps")
+            else o3.Irreps(str(model.products[0].linear.irreps_out))
+        ),
         "edge_irreps": model.edge_irreps if hasattr(model, "edge_irreps") else None,
         "MLP_irreps": o3.Irreps(f"{mlp_scalars_per_head}x0e"),
         "gate": gate,
@@ -755,7 +761,7 @@ def get_swa(
             virials_weight=args.swa_virials_weight,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight},  virials_weight: {args.swa_virials_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight},  virials_weight: {args.swa_virials_weight} and initial lr : {args.swa_lr} (cosine decay)"
         )
     elif args.loss == "stress":
         loss_fn_energy = modules.WeightedEnergyForcesStressLoss(
@@ -764,7 +770,7 @@ def get_swa(
             stress_weight=args.swa_stress_weight,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight} and initial lr : {args.swa_lr} (cosine decay)"
         )
     elif args.loss == "dipole_polar":
         loss_fn_energy = modules.DipolePolarLoss(
@@ -772,7 +778,7 @@ def get_swa(
             polarizability_weight=args.swa_polarizability_weight,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, dipole weight : {args.swa_dipole_weight}, polarizability weight : {args.swa_polarizability_weight}, and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, dipole weight : {args.swa_dipole_weight}, polarizability weight : {args.swa_polarizability_weight}, and initial lr : {args.swa_lr} (cosine decay)"
         )
     elif args.loss == "energy_forces_dipole":
         loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(
@@ -781,7 +787,7 @@ def get_swa(
             dipole_weight=args.swa_dipole_weight,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and initial lr : {args.swa_lr} (cosine decay)"
         )
     elif args.loss == "universal":
         loss_fn_energy = modules.UniversalLoss(
@@ -791,7 +797,7 @@ def get_swa(
             huber_delta=args.huber_delta,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, stress weight : {args.swa_stress_weight} and initial lr : {args.swa_lr} (cosine decay)"
         )
     else:
         loss_fn_energy = modules.WeightedEnergyForcesLoss(
@@ -799,15 +805,24 @@ def get_swa(
             forces_weight=args.swa_forces_weight,
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and initial lr : {args.swa_lr} (cosine decay)"
         )
+    # Use CosineAnnealingLR for gradual lr decay during Stage 2,
+    # replacing constant SWALR that caused F divergence.
+    # T_max = remaining epochs in Stage 2; eta_min = swa_lr / 10
+    stage_two_epochs = max(1, args.max_num_epochs - args.start_swa)
+    eta_min = getattr(args, 'swa_eta_min', None)
+    if eta_min is None:
+        eta_min = args.swa_lr / 10.0
+    logging.info(
+        f"Stage Two lr schedule: CosineAnnealingLR from {args.swa_lr} -> {eta_min:.1e} over {stage_two_epochs} epochs"
+    )
     swa = SWAContainer(
         model=AveragedModel(model),
-        scheduler=SWALR(
+        scheduler=CosineAnnealingLR(
             optimizer=optimizer,
-            swa_lr=args.swa_lr,
-            anneal_epochs=1,
-            anneal_strategy="linear",
+            T_max=stage_two_epochs,
+            eta_min=eta_min,
         ),
         start=args.start_swa,
         loss_fn=loss_fn_energy,
@@ -1024,13 +1039,31 @@ class LRScheduler:
                 factor=args.lr_factor,
                 patience=args.scheduler_patience,
             )
+        elif args.scheduler == "CosineAnnealingLR":
+            # Stage 1 cosine decay: lr → lr/10 over Stage 1 epochs
+            t_max = getattr(args, 'lr_cosine_t_max', None)
+            if t_max is None:
+                t_max = getattr(args, 'start_swa', None)
+            if t_max is None or t_max <= 0:
+                t_max = args.max_num_epochs
+            eta_min = getattr(args, 'lr_cosine_eta_min', None)
+            if eta_min is None:
+                eta_min = max(args.lr / 10.0, 1e-6)
+            self.lr_scheduler = CosineAnnealingLR(
+                optimizer=optimizer,
+                T_max=t_max,
+                eta_min=eta_min,
+            )
+            logging.info(
+                f"Stage 1 lr schedule: CosineAnnealingLR from {args.lr} -> {eta_min:.1e} over {t_max} epochs"
+            )
         else:
             raise RuntimeError(f"Unknown scheduler: '{args.scheduler}'")
 
     def step(self, metrics=None, epoch=None):  # pylint: disable=E1123
         if self._optimizer_type == "schedulefree":
             return  # In principle, schedulefree optimizer can be used with a scheduler but the paper suggests it's not necessary
-        if self.scheduler == "ExponentialLR":
+        if self.scheduler in ("ExponentialLR", "CosineAnnealingLR"):
             self.lr_scheduler.step(epoch=epoch)
         elif self.scheduler == "ReduceLROnPlateau":
             self.lr_scheduler.step(  # pylint: disable=E1123

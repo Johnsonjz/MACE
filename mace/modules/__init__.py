@@ -24,7 +24,7 @@ from .blocks import (
     RealAgnosticResidualNonLinearInteractionBlock,
     ScaleShiftBlock,
 )
-from .extensions import MACESOG, PolarMACE
+from .extensions import MACESOG, PolarMACE, ZeroInteractionMPASOG
 from .loss import (
     DipolePolarLoss,
     DipoleSingleLoss,
@@ -111,6 +111,7 @@ __all__ = [
     "AtomicDielectricMACE",
     "EnergyDipolesMACE",
     "MACESOG",
+    "ZeroInteractionMPASOG",
     "PolarMACE",
     "WeightedEnergyForcesLoss",
     "WeightedForcesLoss",

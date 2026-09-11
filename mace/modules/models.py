@@ -28,6 +28,8 @@ from .blocks import (
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
     RadialEmbeddingBlock,
+    RealAgnosticDensityInteractionBlock,
+    RealAgnosticInteractionBlock,
     ScaleShiftBlock,
 )
 from .utils import (
@@ -104,6 +106,8 @@ class MACE(torch.nn.Module):
         self.use_so3 = use_so3
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
+        # Store original hidden_irreps for accurate config extraction
+        self._hidden_irreps = str(hidden_irreps)
 
         # Embedding
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
@@ -166,13 +170,44 @@ class MACE(torch.nn.Module):
             radial_MLP = [64, 64, 64]
         # Interactions and readout
         self.atomic_energies_fn = AtomicEnergiesBlock(atomic_energies)
-        if num_interactions == 1:
+        if num_interactions == 1 and hidden_irreps.lmax == 0:
+            # Legacy scalar-only path (e.g. 128x0e): keep only scalars, matching
+            # the historical 1-layer architecture (li7_full_0713_1013).
             hidden_irreps_out = str(hidden_irreps[0])
         else:
             hidden_irreps_out = hidden_irreps
         edge_irreps_first = None
         if use_edge_irreps_first and edge_irreps is not None:
             edge_irreps_first = o3.Irreps(f"{edge_irreps.count(o3.Irrep(0, 1))}x0e")
+
+        # When num_interactions=1 with hidden_irreps containing vector channels
+        # (e.g. 128x0e+128x1o), Residual interaction blocks fail because their
+        # skip_tp(node_feats_irreps=128x0e x attrs -> hidden_irreps=128x0e+128x1o)
+        # cannot produce 1o output from 0e×0e tensor product.
+        # Non-Residual blocks (skip_tp uses irreps_out, not hidden_irreps) are fine.
+        if (
+            num_interactions == 1
+            and hidden_irreps.lmax > 0
+            and "Residual" in str(interaction_cls_first)
+        ):
+            _RESIDUAL_TO_NONRESIDUAL = {
+                "RealAgnosticResidualInteractionBlock": RealAgnosticInteractionBlock,
+                "RealAgnosticDensityResidualInteractionBlock": RealAgnosticDensityInteractionBlock,
+                "RealAgnosticAttResidualInteractionBlock": RealAgnosticInteractionBlock,
+                "RealAgnosticResidualNonLinearInteractionBlock": RealAgnosticInteractionBlock,
+            }
+            for _res_name, _nonres_cls in _RESIDUAL_TO_NONRESIDUAL.items():
+                if _res_name in str(interaction_cls_first):
+                    import warnings
+                    warnings.warn(
+                        f"num_interactions=1 with hidden_irreps containing vector channels: "
+                        f"auto-switching interaction_cls_first from {_res_name} to "
+                        f"{_nonres_cls.__name__} (Residual skip_tp cannot produce vector "
+                        f"channels from scalar input)"
+                    )
+                    interaction_cls_first = _nonres_cls
+                    break
+
         inter = interaction_cls_first(
             node_attrs_irreps=node_attr_irreps,
             node_feats_irreps=node_feats_irreps,
@@ -208,7 +243,45 @@ class MACE(torch.nn.Module):
         self.products = torch.nn.ModuleList([prod])
 
         self.readouts = torch.nn.ModuleList()
-        if not use_last_readout_only:
+        if num_interactions == 1 and hidden_irreps.lmax == 0:
+            # Legacy scalar-only path (e.g. 128x0e): single Linear readout —
+            # exactly the historical 1-layer architecture (li7_full_0713_1013).
+            # readout_cls/MLP_irreps/gate are intentionally unused here so old
+            # scalar foundations (readout_cls=LinearReadoutBlock) build without
+            # the 7-argument TypeError.
+            if not use_last_readout_only:
+                self.readouts.append(
+                    LinearReadoutBlock(
+                        hidden_irreps_out,
+                        o3.Irreps(f"{len(heads)}x0e"),
+                        cueq_config,
+                        oeq_config,
+                    )
+                )
+        elif num_interactions == 1:
+            # 1-layer model: Linear baseline + Nonlinear correction
+            # Both readouts read from the SAME product output (same feature space),
+            # decomposing energy as: E = E_linear + E_nonlinear_correction
+            self.readouts.append(
+                LinearReadoutBlock(
+                    hidden_irreps_out,
+                    o3.Irreps(f"{len(heads)}x0e"),
+                    cueq_config,
+                    oeq_config,
+                )
+            )
+            self.readouts.append(
+                readout_cls(
+                    hidden_irreps_out,
+                    (len(heads) * MLP_irreps).simplify(),
+                    gate,
+                    o3.Irreps(f"{len(heads)}x0e"),
+                    len(heads),
+                    cueq_config,
+                    oeq_config,
+                )
+            )
+        elif not use_last_readout_only:
             self.readouts.append(
                 LinearReadoutBlock(
                     hidden_irreps_out,
@@ -385,7 +458,7 @@ class MACE(torch.nn.Module):
             node_feats_concat.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
+            feat_idx = min(i, len(node_feats_concat) - 1)
             node_es = readout(node_feats_concat[feat_idx], node_heads)[
                 num_atoms_arange, node_heads
             ]
@@ -565,7 +638,7 @@ class ScaleShiftMACE(MACE):
             node_feats_list.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
+            feat_idx = min(i, len(node_feats_list) - 1)
             node_es_list.append(
                 readout(node_feats_list[feat_idx], node_heads)[
                     num_atoms_arange, node_heads

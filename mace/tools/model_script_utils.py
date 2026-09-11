@@ -13,6 +13,20 @@ from mace.tools.torch_tools import dtype_dict
 from mace.tools.utils import AtomicNumberTable
 
 
+def _copy_module_params(src: torch.nn.Module, tgt: torch.nn.Module) -> None:
+    """Copy parameters and buffers from src module to tgt module by name."""
+    src_state = src.state_dict()
+    tgt_state = tgt.state_dict()
+    for key in tgt_state:
+        if key in src_state and tgt_state[key].shape == src_state[key].shape:
+            tgt_state[key].copy_(src_state[key].to(dtype=tgt_state[key].dtype))
+        elif key in src_state:
+            logging.warning(
+                f"  Skipping {key}: shape mismatch "
+                f"({src_state[key].shape} -> {tgt_state[key].shape})"
+            )
+
+
 def configure_model(
     args,
     train_loader,
@@ -83,6 +97,7 @@ def configure_model(
         "ScaleShiftMACE",
         "MACELES",
         "MACESOG",
+        "ZeroInteractionMPASOG",
         "PolarMACE",
     ]:
         logging.info("Loading FOUNDATION model")
@@ -124,6 +139,8 @@ def configure_model(
             args.model = "FoundationMACELES"
         elif args.model == "MACESOG":
             args.model = "FoundationMACESOG"
+        elif args.model == "ZeroInteractionMPASOG":
+            args.model = "FoundationZeroInteractionMPASOG"
         elif args.model in ("MACE", "ScaleShiftMACE"):
             args.model = "FoundationMACE"
         model_config_foundation["heads"] = heads
@@ -209,6 +226,48 @@ def configure_model(
             max_L=args.max_L,
             default_dtype=dtype_dict.get(args.default_dtype, torch.float64),
         )
+
+        # Graft SOG-specific parameters (sog_readouts, sog module)
+        # Not handled by load_foundations_elements since SOG is MACESOG-only
+        if hasattr(model_foundation, "sog_readouts") and hasattr(model, "sog_readouts"):
+            logging.info("Grafting SOG parameters from foundation model")
+            # Graft the foundation's sog_readouts ONLY when both target and
+            # foundation are direct-charge models. The current foundation
+            # (grafted_mpa_sog_v3) is a QEq model whose sog_readouts are
+            # χ (electronegativity) readouts (~±1-4 eV/e) — the wrong scale
+            # for a direct charge q (~±0.4 e), which blows up E_lr at init.
+            # For QEq targets χ must also start fresh (Mulliken bias). The SOG
+            # Gaussian kernel (trained amp/bandwidth) is still grafted below.
+            if not getattr(model, "use_qeq", False) and not getattr(
+                model_foundation, "use_qeq", False
+            ):
+                for i, (tgt_ro, src_ro) in enumerate(
+                    zip(model.sog_readouts, model_foundation.sog_readouts)
+                ):
+                    _copy_module_params(src_ro, tgt_ro)
+            if hasattr(model_foundation, "sog") and hasattr(model, "sog"):
+                _copy_module_params(model_foundation.sog, model.sog)
+
+        # Graft per-element charge shift (from charge_init strategies)
+        if hasattr(model_foundation, "per_element_charge_shift") and hasattr(
+            model, "per_element_charge_shift"
+        ):
+            logging.info("Grafting per-element charge shift from foundation model")
+            _copy_module_params(
+                model_foundation.per_element_charge_shift,
+                model.per_element_charge_shift,
+            )
+            model._use_per_element_charge_init = True
+
+        # Re-freeze interaction/product layers for zero-interaction models.
+        # load_foundations_elements creates new nn.Parameter objects (which
+        # default to requires_grad=True), so the initial freeze is undone.
+        if model.__class__.__name__ == "ZeroInteractionMPASOG":
+            logging.info("Re-freezing interaction/product layers after foundation load")
+            for p in model.interactions.parameters():
+                p.requires_grad = False
+            for p in model.products.parameters():
+                p.requires_grad = False
 
     return model, output_args
 
@@ -344,6 +403,13 @@ def _build_model(
             sog_arguments=args.sog_arguments,
             **model_config_foundation,
         )
+    if args.model == "FoundationZeroInteractionMPASOG":
+        from mace.modules.extensions import ZeroInteractionMPASOG
+
+        return ZeroInteractionMPASOG(
+            sog_arguments=args.sog_arguments,
+            **model_config_foundation,
+        )
     if args.model == "ScaleShiftBOTNet":
         # say it is deprecated
         raise RuntimeError("ScaleShiftBOTNet is deprecated, use MACE instead")
@@ -427,6 +493,28 @@ def _build_model(
         from mace.modules.extensions import MACESOG
 
         return MACESOG(
+            sog_arguments=args.sog_arguments,
+            **model_config,
+            pair_repulsion=args.pair_repulsion,
+            distance_transform=args.distance_transform,
+            correlation=args.correlation,
+            gate=modules.gate_dict[args.gate],
+            interaction_cls_first=modules.interaction_classes[args.interaction_first],
+            MLP_irreps=o3.Irreps(args.MLP_irreps),
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=[0.0] * len(heads),
+            radial_MLP=ast.literal_eval(args.radial_MLP),
+            radial_type=args.radial_type,
+            heads=heads,
+            embedding_specs=args.embedding_specs,
+            use_embedding_readout=args.use_embedding_readout,
+            use_last_readout_only=args.use_last_readout_only,
+            use_agnostic_product=args.use_agnostic_product,
+        )
+    if args.model == "ZeroInteractionMPASOG":
+        from mace.modules.extensions import ZeroInteractionMPASOG
+
+        return ZeroInteractionMPASOG(
             sog_arguments=args.sog_arguments,
             **model_config,
             pair_repulsion=args.pair_repulsion,

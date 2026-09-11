@@ -39,7 +39,14 @@ class CheckpointBuilder:
     ) -> None:
         state.model.load_state_dict(checkpoint["model"], strict=strict)  # type: ignore
         state.optimizer.load_state_dict(checkpoint["optimizer"])
-        state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        try:
+            state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        except (ValueError, KeyError, TypeError) as e:
+            import logging
+            logging.warning(
+                f"Could not load scheduler state (scheduler type may have changed): {e}. "
+                f"Starting with fresh scheduler."
+            )
 
 
 @dataclasses.dataclass
@@ -184,7 +191,7 @@ class CheckpointIO:
 
         logging.info(f"Loading checkpoint: {checkpoint_info.path}")
         return (
-            torch.load(f=checkpoint_info.path, map_location=device),
+            torch.load(f=checkpoint_info.path, map_location=device, weights_only=False),
             checkpoint_info.epochs,
         )
 
