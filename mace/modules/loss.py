@@ -411,10 +411,10 @@ class UniversalLoss(torch.nn.Module):
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         num_atoms = ref.ptr[1:] - ref.ptr[:-1]
-        configs_stress_weight = ref.stress_weight.view(-1, 1, 1)
-        configs_energy_weight = ref.energy_weight
+        configs_stress_weight = (ref.weight * ref.stress_weight).view(-1, 1, 1)
+        configs_energy_weight = ref.weight * ref.energy_weight
         configs_forces_weight = torch.repeat_interleave(
-            ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
+            ref.weight * ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
         ).unsqueeze(-1)
         if ddp:
             loss_energy = torch.nn.functional.huber_loss(

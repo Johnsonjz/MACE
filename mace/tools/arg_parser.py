@@ -906,6 +906,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default='{"embedding_lr_factor": 1.0, "interactions_lr_factor": 1.0, "products_lr_factor": 1.0, "readouts_lr_factor": 1.0}',
     )
     parser.add_argument(
+        "--fresh_readout_heads",
+        help="Comma-separated head indices whose energy readout is re-initialised "
+        "to zero after the foundation graft instead of inheriting the foundation's "
+        "readout. The graft replicates a single-head readout into every head, so in "
+        "a multi-head setup a new head otherwise starts as a copy of the "
+        "foundation's domain. Requires --foundation_filter_elements=True.",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--freeze",
         help="Freeze layers from 1 to N. Can be positive or negative, e.g. -1 means the last layer is frozen. 0 or None means all layers are active and is a default setting",
         type=int,

@@ -218,6 +218,16 @@ def configure_model(
     model = _build_model(args, model_config, model_config_foundation, heads)
 
     if model_foundation is not None:
+        _fresh_readout_heads = getattr(args, "fresh_readout_heads", None)
+        if isinstance(_fresh_readout_heads, str):
+            _fresh_readout_heads = [
+                int(x) for x in _fresh_readout_heads.split(",") if x.strip() != ""
+            ]
+        if _fresh_readout_heads and not args.foundation_filter_elements:
+            raise ValueError(
+                "--fresh_readout_heads requires --foundation_filter_elements=True "
+                "(otherwise the readout is never grafted and is already fresh)."
+            )
         model = load_foundations_elements(
             model,
             model_foundation,
@@ -225,6 +235,7 @@ def configure_model(
             load_readout=args.foundation_filter_elements,
             max_L=args.max_L,
             default_dtype=dtype_dict.get(args.default_dtype, torch.float64),
+            fresh_readout_heads=_fresh_readout_heads,
         )
 
         # Graft SOG-specific parameters (sog_readouts, sog module)

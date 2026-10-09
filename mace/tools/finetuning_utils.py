@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import torch
@@ -26,6 +27,36 @@ def _scale_module_weights(module: torch.nn.Module, factor: float) -> None:
             param.mul_(factor)
 
 
+def _zero_readout_head(param: torch.nn.Parameter, num_heads: int, head_idx: int) -> bool:
+    """Zero the FINAL-projection slice of a readout weight that drives one head.
+
+    Only the last projection needs touching, and it is always laid out with the
+    head axis last:
+
+      LinearReadoutBlock.linear.weight      -> (C, H)
+      NonLinearReadoutBlock.linear_2.weight -> (S1, H)
+
+    Zeroing column `head_idx` there makes that head's output identically zero
+    for every input, and provably leaves the other heads untouched (the other
+    columns are separate).  The intermediate `linear_1` is deliberately left
+    alone: it feeds ALL heads, its head blocking is not "H last"
+    (flat index is c*S1 + i, so unit i = head h sits at h*J + j), and it does
+    not need zeroing because its contribution to the target head is multiplied
+    by the zeroed column downstream.
+
+    Returns True if applied; False if the shape is inconsistent with num_heads
+    (caller treats that as a hard error rather than silently skipping).
+    """
+    if num_heads <= 0:
+        return False
+    with torch.no_grad():
+        flat = param.data.reshape(-1)
+        if flat.numel() % num_heads != 0 or flat.numel() == 0:
+            return False
+        flat.view(-1, num_heads)[:, head_idx] = 0.0
+    return True
+
+
 def load_foundations_elements(
     model: torch.nn.Module,
     model_foundations: torch.nn.Module,
@@ -35,9 +66,18 @@ def load_foundations_elements(
     use_scale=True,
     max_L=2,
     default_dtype: Optional[torch.dtype] = None,
+    fresh_readout_heads=None,
 ):
     """
     Load the foundations of a model into a model for fine-tuning.
+
+    fresh_readout_heads: optional iterable of head indices whose energy readout
+        should be re-initialised to zero instead of inheriting the foundation's.
+        The graft replicates a single-head readout into EVERY head, so in a
+        multi-head setup a new head otherwise starts as a copy of the
+        foundation's (e.g. an OMat head starting as the MP head) and has to
+        unlearn that domain before it can learn its own.  Zeroing gives it a
+        neutral start (it predicts the per-head E0s and nothing else).
     """
     assert model_foundations.r_max == model.r_max
     z_table = AtomicNumberTable([int(z) for z in model_foundations.atomic_numbers])
@@ -356,6 +396,107 @@ def load_foundations_elements(
                         readout.linear_2.bias = torch.nn.Parameter(
                             model_readouts_one_linear_2_bias
                         )
+
+    # Optionally give selected heads a NEUTRAL readout instead of the
+    # foundation's.  Done after the transfer loop but BEFORE the sog_readouts
+    # block below, which seeds sog_readouts from model.readouts — so the charge
+    # readout of a re-initialised head starts neutral too, consistently.
+    #
+    # Everything here is verified numerically rather than trusted: after
+    # zeroing we probe each readout block on a fixed dummy input and require
+    # (a) the re-initialised head's output is exactly 0, and (b) every OTHER
+    # head's output is bit-for-bit unchanged.  Getting the head layout wrong is
+    # otherwise silent and catastrophic - it corrupts the heads you meant to
+    # keep (observed: zeroing the wrong axis dropped a healthy warm-started MP
+    # head from E=26.6 to E=203.6 meV/atom).
+    if load_readout and fresh_readout_heads:
+        _n_heads = len(model.heads)
+        _head_names = list(model.heads)
+        _fresh = list(fresh_readout_heads)
+        for _h in _fresh:
+            if not 0 <= _h < _n_heads:
+                raise ValueError(
+                    f"fresh_readout_heads: head {_h} out of range (model has "
+                    f"{_n_heads} heads: {_head_names})"
+                )
+
+        # Per-readout fixed probe input.  The blocks do NOT share an input width
+        # (the scalar block consumes 128x0e, the non-linear one consumes
+        # 128x0e+128x1o = 512), so derive it from each block's own irreps_in.
+        def _probe_for(_readout):
+            for _mod_name in ("linear", "linear_1"):
+                _mod = getattr(_readout, _mod_name, None)
+                if _mod is not None and hasattr(_mod, "irreps_in"):
+                    # match the module's own dtype and device: a float64 or CPU
+                    # probe against a float32/cuda model raises deep inside
+                    # e3nn's tensordot / cuda mm.
+                    return torch.randn(
+                        3, _mod.irreps_in.dim,
+                        dtype=_mod.weight.dtype, device=_mod.weight.device,
+                    )
+            raise RuntimeError(
+                f"fresh_readout_heads: cannot determine the input width of "
+                f"{type(_readout).__name__}; refusing to continue silently."
+            )
+
+        _probes = [_probe_for(_r) for _r in model.readouts]
+        _before = []
+        for _readout, _p in zip(model.readouts, _probes):
+            with torch.no_grad():
+                _before.append(_readout(_p).clone())
+
+        _applied = []
+        for _readout in model.readouts:
+            _cls = _readout.__class__.__name__
+            if _cls == "LinearReadoutBlock":
+                _target = _readout.linear
+            elif _cls in ("NonLinearBiasReadoutBlock", "NonLinearReadoutBlock"):
+                _target = getattr(_readout, "linear_2", None)
+            else:
+                _target = None
+            if _target is None or not hasattr(_target, "weight"):
+                raise RuntimeError(
+                    f"fresh_readout_heads: don't know which weight drives the "
+                    f"heads in {_cls}; refusing to continue silently."
+                )
+            if not _zero_readout_head(_target.weight, _n_heads, _h):
+                raise RuntimeError(
+                    f"fresh_readout_heads: {_cls} weight has "
+                    f"{_target.weight.numel()} elements, not divisible by "
+                    f"{_n_heads} heads — refusing to continue silently."
+                )
+            _applied.append(f"{_cls}.{type(_target).__name__}.weight")
+
+        # --- verify on the probe ---
+        for _i, _readout in enumerate(model.readouts):
+            with torch.no_grad():
+                _after = _readout(_probes[_i]).clone()
+            _b, _a = _before[_i], _after
+            if _a.ndim < 2 or _a.shape[-1] != _n_heads:
+                raise RuntimeError(
+                    f"fresh_readout_heads: readout {_i} output shape "
+                    f"{tuple(_a.shape)} does not end in {_n_heads} heads."
+                )
+            if _a[:, _h].abs().max().item() != 0.0:
+                raise RuntimeError(
+                    f"fresh_readout_heads: head {_h} of readout {_i} is not "
+                    "zero after re-initialisation — aborting."
+                )
+            _others = [k for k in range(_n_heads) if k not in _fresh]
+            for _k in _others:
+                if not torch.equal(_b[:, _k], _a[:, _k]):
+                    _d = (_b[:, _k] - _a[:, _k]).abs().max().item()
+                    raise RuntimeError(
+                        f"fresh_readout_heads: zeroing head {_h} perturbed "
+                        f"head {_k} of readout {_i} (max|delta|={_d:.3e}). "
+                        "Head layout mismatch — refusing to corrupt a head."
+                    )
+        logging.info(
+            "Re-initialised readout for head(s) %s (%s): zeroed %s; "
+            "verified other heads unchanged on a probe input.",
+            _fresh, [_head_names[k] for k in _fresh], ", ".join(_applied),
+        )
+
     # Copy readout weights to sog_readouts (if present).
     # sog_readouts are created as architectural copies of readouts during
     # MACESOG.__init__ but with random weights.  We seed them from the
